@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import warnings
 from glob import glob
@@ -25,7 +26,7 @@ warnings.filterwarnings("ignore")
 
 def read_mask(mask_path, invert=False):
     mask = Image.open(mask_path)
-    mask = resize(mask, max_size=512, interpolation=Image.NEAREST)
+    #mask = resize(mask, max_size=512, interpolation=Image.NEAREST)
     mask = np.array(mask)
     if len(mask.shape) == 3:
         if mask.shape[2] == 4:
@@ -60,6 +61,8 @@ def preprocess(img: Image, mask: Image, resolution: int) -> torch.Tensor:
     mask = np.array(mask)[:, :, np.newaxis] // 255
     img = torch.Tensor(img).float() * 2 / 255 - 1
     mask = torch.Tensor(mask).float()
+    print("img tensor shape: ", img.size())
+    print("mask tensor shape: ", mask.size())
     img = img.permute(2, 0, 1).unsqueeze(0)
     mask = mask.permute(2, 0, 1).unsqueeze(0)
     x = torch.cat([mask - 0.5, img * mask], dim=1)
@@ -112,34 +115,65 @@ def main():
         model = model.to("cuda")
     model.eval()
 
-    img_extensions = {".jpg", ".jpeg", ".png"}
-    img_paths = []
-    for img_extension in img_extensions:
-        img_paths += glob(os.path.join(args.images_dir, "**", f"*{img_extension}"), recursive=True)
-
-    img_paths = sorted(img_paths)
-
-    for img_path in tqdm(img_paths):
-        mask_path = os.path.join(args.masks_dir, "".join(os.path.basename(img_path).split('.')[:-1]) + ".png")
-
-        img = Image.open(img_path).convert("RGB")
-        img_resized = resize(img, max_size=resolution)
-        mask = read_mask(mask_path, invert=args.invert_mask)
-        mask_resized = resize(mask, max_size=resolution, interpolation=Image.NEAREST)
-
-        x = preprocess(img_resized, mask_resized, resolution)
+    mask_dirs = os.listdir(args.masks_dir)
+    for mask_dir in mask_dirs:
+        
+        xs = []
+        #img_extensions = {".jpg", ".jpeg", ".png"}
+        #img_paths = []
+        mask_extensions = {".png"}
+        mask_paths = []
+        imgs = []
+        masks = []
+        for mask_extension in mask_extensions:
+            mask_paths += glob(os.path.join(args.masks_dir, mask_dir, "**", f"*{mask_extension}"), recursive=True)
+        print("mask paths: ", mask_paths)
+        mask_paths = sorted(mask_paths)
+        for mask_path in tqdm(mask_paths):
+            img_path = os.path.join(args.images_dir, "".join(os.path.basename(mask_path).split('.')[:-1]) + ".jpg")
+            print("mask path: ", mask_path)
+            print("image path: ", img_path)
+            if not os.path.isfile(img_path):
+                continue
+            img = Image.open(img_path).convert("RGB")
+            #img_resized = resize(img, max_size=resolution)
+            img_resized = img
+            mask = read_mask(mask_path, invert=args.invert_mask)
+            print("mask before: ", np.array(mask).shape)
+            print("img before: ", np.array(img).shape)
+            #mask_resized = resize(mask, max_size=resolution, interpolation=Image.NEAREST)
+            #mask_cvt = cv2.cvtColor(np.array(mask), cv2.COLOR_GRAY2BGR)
+            # print("mask after recolor: ", mask_cvt.shape)
+            mask_resized = cv2.resize(np.array(mask), (np.array(img_resized).shape[1], np.array(img_resized).shape[0]))
+            imgs.append(np.array(img_resized))
+            masks.append(np.array(mask_resized))
+            #print(mask_resized.shape)
+            print(resolution)
+            print("mask after resize: ", mask_resized.shape)
+            x = preprocess(img_resized, Image.fromarray(mask_resized), resolution)
+            xs.append(x)
+        if len(xs) == 0:
+            continue
+        x = torch.cat(xs)
+        #print("masks shape ", np.array(masks).shape)
+        print("input shape ", x.shape)
         if cuda:
             x = x.to("cuda")
         with torch.no_grad():
-            result_image = model(x)[0]
-        result_image = (result_image * 0.5 + 0.5).clamp(0, 1) * 255
-        result_image = result_image.to(torch.uint8).permute(1, 2, 0).detach().to("cpu").numpy()
-
-        result_image = cv2.resize(result_image, dsize=img_resized.size, interpolation=cv2.INTER_CUBIC)
-        mask_resized = np.array(mask_resized)[:, :, np.newaxis] // 255
-        composed_img = img_resized * mask_resized + result_image * (1 - mask_resized)
-        composed_img = Image.fromarray(composed_img)
-        composed_img.save(args.output_dir / f"{Path(img_path).stem}.png")
+            result_images = model(x)
+            print("result_images shape before clamping ", result_images.shape)
+        result_images = (result_images * 0.5 + 0.5).clamp(0, 1) * 255
+        print("result_images shape before permutation ", result_images.shape)
+        result_images = result_images.to(torch.uint8).permute(0, 2, 3, 1).detach().to("cpu").numpy()
+        print("result_images shape ", result_images.shape)
+        for i, result_image in enumerate(result_images):
+            print("result_image size ", result_image.shape)
+            result_image = cv2.resize(result_image, dsize=img_resized.size[:2], interpolation=cv2.INTER_CUBIC)
+            print("result_image size after resize ", result_image.shape)
+            mask_resized_new = np.array(masks[i])[:, :, np.newaxis] // 255
+            composed_img = imgs[i] * mask_resized_new + result_image * (1 - mask_resized_new)
+            composed_img = Image.fromarray(composed_img)
+            composed_img.save(args.output_dir / f"{Path(mask_paths[i]).stem}.png")
 
 
 if __name__ == '__main__':
